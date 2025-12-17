@@ -294,7 +294,7 @@ contract CardGameVRF is VRFConsumerBaseV2Plus, Pausable, ReentrancyGuard, EIP712
     }
 
     // VRF 지연 시 환급(무승부 환급과 동일)
-    function refundAfterTimeout() external nonReentrant whenNotPaused {
+    function refundAfterTimeout() external nonReentrant {
         Session storage s = sessions[msg.sender];
         require(s.state == State.WAITING_VRF, "not waiting");
         require(block.timestamp > uint256(s.startedAt) + timeoutSeconds, "not timed out");
