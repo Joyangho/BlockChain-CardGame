@@ -13,70 +13,79 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {VRFConsumerBaseV2Plus} from "@chainlink/contracts/src/v0.8/vrf/dev/VRFConsumerBaseV2Plus.sol";
 import {VRFV2PlusClient} from "@chainlink/contracts/src/v0.8/vrf/dev/libraries/VRFV2PlusClient.sol";
 
-contract CardGameVRF is
-    VRFConsumerBaseV2Plus,
-    Ownable,
-    Pausable,
-    ReentrancyGuard,
-    EIP712
-{
+contract CardGameVRF is VRFConsumerBaseV2Plus, Ownable, Pausable, ReentrancyGuard, EIP712 {
     using SafeERC20 for IERC20;
 
-    // --- 토큰 / 룰 ---
+    // ====== 게임 토큰/룰 ======
     IERC20 public immutable SABU;
-    uint256 public immutable entryFee;   // 참가비(지갑이 아닌 예치금에서 차감)
-    uint256 public immutable reward;     // 승리 시 당첨금(즉시 전송 X, winnings에 적립)
-    uint256 public constant WITHDRAW_FEE_BPS = 500; // 당첨금 출금 시에만 5% 수수료(bps)
+    uint256 public immutable entryFee;   // 참가비(예치금에서 차감)
+    uint256 public immutable reward;     // 승리 시 당첨금(적립)
+    uint256 public constant WITHDRAW_FEE_BPS = 500; // 당첨금 출금 시에만 5%
 
-    // --- VRF 설정 (v2.5 구독 방식: 하우스가 미리 충전) ---
+    // ====== VRF 설정 ======
     uint256 public immutable subscriptionId;
     bytes32 public immutable keyHash;
     uint16  public immutable requestConfirmations;
     uint32  public immutable callbackGasLimit;
-    bool    public payWithNative; // 구독이 네이티브 결제를 지원할 때 사용
+    bool    public payWithNative;
 
-    // --- 유저 잔고 ---
-    mapping(address => uint256) public deposits; // 유저 예치금(내 돈)
-    mapping(address => uint256) public winnings; // 유저 당첨금(출금 시 5% 수수료)
-    mapping(address => bool) public hasWon;      // 마지막 게임 결과(UI 표시용)
+    // ====== 릴레이어(가스리스 실행자) ======
+    // "서명만으로 게임"을 하려면 누군가 tx를 제출해야 함(릴레이어).
+    // 이 값을 고정하면 '제3자가 서명을 들고 컨트랙트에 직접 제출'하는 걸 막을 수 있음.
+    address public relayer;
 
-    // 하우스가 출금해도 지급불능이 나지 않도록 “잠금”으로 관리
-    uint256 public totalDeposits;     // 전체 예치금 합
-    uint256 public totalWinningsOwed; // 전체 당첨금 채무 합(총액 기준)
-    uint256 public reservedPending;   // VRF 대기 중 게임들의 최대 의무(예약금) 합
+    // ====== 유저 잔고 ======
+    mapping(address => uint256) public deposits; // 예치금(내 돈)
+    mapping(address => uint256) public winnings; // 당첨금(출금 시 5% 수수료)
+    mapping(address => bool) public hasWon;      // 마지막 결과(UI 용)
 
-    // --- 세션: 1 유저당 동시에 1게임만 대기 가능 ---
+    // ====== 하우스 출금 안전장치(잠금) ======
+    uint256 public totalDeposits;
+    uint256 public totalWinningsOwed;
+    uint256 public reservedPending;
+
+    // ====== 세션(유저당 동시 1판) ======
     enum State { NONE, WAITING_VRF }
     struct Session {
         State state;
-        bool choiceBlue;     // true=Blue, false=Red
+        bool choiceBlue;
         uint256 requestId;
-        uint64 startedAt;    // VRF 지연 시 구제(refund)용
-        uint256 reserved;    // 이 판에서 잡은 예약금 = max(entryFee, reward)
+        uint64 startedAt;
+        uint256 reserved; // max(entryFee, reward)
     }
     mapping(address => Session) public sessions;
     mapping(uint256 => address) public requestToPlayer;
 
-    // VRF가 오래 지연될 경우 유저가 참가비를 환급 받고 세션을 해제할 수 있는 시간(선택)
     uint256 public immutable timeoutSeconds;
 
-    // --- 가스리스 게임(서명 기반) ---
-    // 유저는 EIP-712 서명만 생성하고, relayer가 startGameWithSig()를 호출(가스비 부담)
+    // ====== 서명 기반 게임 시작 ======
     struct PlayIntent {
         address player;
         bool choiceBlue;
-        uint256 nonce;     // 1회성(리플레이 방지) - 무승부여도 새 서명 필요
-        uint256 deadline;  // 만료 시간
+        uint256 nonce;
+        uint256 deadline;
     }
+
     bytes32 private constant PLAY_TYPEHASH =
         keccak256("PlayIntent(address player,bool choiceBlue,uint256 nonce,uint256 deadline)");
+
     mapping(address => uint256) public nonces;
 
-    // --- 이벤트 ---
-    event Deposited(address indexed player, uint256 amount);
+    // ====== 이벤트 ======
+    event RelayerSet(address indexed relayer);
+    event Deposited(address indexed player, uint256 received);
     event DepositWithdrawn(address indexed player, uint256 amount);
+
     event GameStarted(address indexed player, uint256 indexed requestId, bool choiceBlue);
-    event GameResolved(address indexed player, uint256 indexed requestId, uint256 blueNumber, uint256 redNumber, bool win, bool tie);
+    event GameResolved(
+        address indexed player,
+        uint256 indexed requestId,
+        uint256 blueNumber,
+        uint256 redNumber,
+        bool win,
+        bool tie
+    );
+
     event WinningsWithdrawn(address indexed player, uint256 gross, uint256 fee, uint256 net);
     event HouseWithdrawn(address indexed to, uint256 amount);
     event NativePaymentModeSet(bool enabled);
@@ -92,7 +101,8 @@ contract CardGameVRF is
         uint16 _requestConfirmations,
         uint32 _callbackGasLimit,
         bool _payWithNative,
-        uint256 _timeoutSeconds
+        uint256 _timeoutSeconds,
+        address _relayer
     )
         VRFConsumerBaseV2Plus(vrfCoordinator)
         Ownable(msg.sender)
@@ -101,6 +111,7 @@ contract CardGameVRF is
         require(sabuToken != address(0), "SABU=0");
         require(_entryFee > 0 && _reward > 0, "bad rule");
         require(_timeoutSeconds >= 60, "timeout too small");
+        require(_relayer != address(0), "relayer=0");
 
         SABU = IERC20(sabuToken);
         entryFee = _entryFee;
@@ -113,9 +124,12 @@ contract CardGameVRF is
         payWithNative = _payWithNative;
 
         timeoutSeconds = _timeoutSeconds;
+
+        relayer = _relayer;
+        emit RelayerSet(_relayer);
     }
 
-    // --- 관리자 기능 ---
+    // ====== 관리자 ======
     function pause() external onlyOwner { _pause(); }
     function unpause() external onlyOwner { _unpause(); }
 
@@ -124,7 +138,13 @@ contract CardGameVRF is
         emit NativePaymentModeSet(enabled);
     }
 
-    // 하우스 출금 가능 금액 = 컨트랙트 잔액 - (예치금 + 당첨금 채무 + VRF 대기 예약금)
+    function setRelayer(address newRelayer) external onlyOwner {
+        require(newRelayer != address(0), "relayer=0");
+        relayer = newRelayer;
+        emit RelayerSet(newRelayer);
+    }
+
+    // 하우스 출금 가능 금액 = 잔액 - (예치금 + 당첨금 채무 + VRF 대기 예약금)
     function availableHouseBalance() public view returns (uint256) {
         uint256 bal = SABU.balanceOf(address(this));
         uint256 locked = totalDeposits + totalWinningsOwed + reservedPending;
@@ -138,80 +158,89 @@ contract CardGameVRF is
         emit HouseWithdrawn(to, amount);
     }
 
-    // --- 유저: 예치/출금(온체인 트랜잭션, 유저 가스비 부담) ---
+    // ====== 유저: 예치/출금 ======
+
+    // 전송세 토큰 방어: 실제 입금량(received) 기준으로 적립
     function deposit(uint256 amount) external nonReentrant whenNotPaused {
         require(amount > 0, "amount=0");
+
+        uint256 beforeBal = SABU.balanceOf(address(this));
         SABU.safeTransferFrom(msg.sender, address(this), amount);
-        deposits[msg.sender] += amount;
-        totalDeposits += amount;
-        emit Deposited(msg.sender, amount);
+        uint256 afterBal = SABU.balanceOf(address(this));
+
+        uint256 received = afterBal - beforeBal;
+        require(received > 0, "received=0");
+
+        deposits[msg.sender] += received;
+        totalDeposits += received;
+
+        emit Deposited(msg.sender, received);
     }
 
     function withdrawDeposit(uint256 amount) external nonReentrant whenNotPaused {
         require(amount > 0, "amount=0");
         require(deposits[msg.sender] >= amount, "insufficient deposit");
+
         deposits[msg.sender] -= amount;
         totalDeposits -= amount;
+
         SABU.safeTransfer(msg.sender, amount);
         emit DepositWithdrawn(msg.sender, amount);
     }
 
-    // 당첨금 출금: 이 시점에만 5% 수수료를 떼고, 수수료는 컨트랙트(하우스 풀)에 남김
     function withdrawWinnings() external nonReentrant whenNotPaused {
         uint256 gross = winnings[msg.sender];
         require(gross > 0, "no winnings");
 
-        // 상태를 먼저 갱신(재진입/중복 출금 방지)
+        // 상태 먼저 갱신(재진입/중복 출금 방지)
         winnings[msg.sender] = 0;
         totalWinningsOwed -= gross;
 
-        uint256 fee = (gross * WITHDRAW_FEE_BPS) / 10_000;
+        uint256 fee = (gross * WITHDRAW_FEE_BPS) / 10_000; // 필요하면 올림 처리로 변경 가능
         uint256 net = gross - fee;
 
-        // fee는 전송하지 않고 컨트랙트에 잔류(하우스 수익/VRF 운영비 재원)
+        // fee는 컨트랙트에 잔류(하우스 풀/운영비)
         SABU.safeTransfer(msg.sender, net);
         emit WinningsWithdrawn(msg.sender, gross, fee, net);
     }
 
-    // --- 게임 시작(서명 기반): relayer가 호출(유저는 서명만) ---
+    // ====== 게임 시작(서명 기반 / 릴레이어 tx) ======
     function startGameWithSig(PlayIntent calldata intent, bytes calldata sig)
         external
         nonReentrant
         whenNotPaused
         returns (uint256 requestId)
     {
+        require(msg.sender == relayer, "only relayer");
+        require(intent.player != address(0), "player=0");
         require(block.timestamp <= intent.deadline, "sig expired");
 
-        // EIP-712 서명 검증(릴레이어가 choice를 바꿀 수 없음)
         bytes32 structHash = keccak256(
             abi.encode(PLAY_TYPEHASH, intent.player, intent.choiceBlue, intent.nonce, intent.deadline)
         );
+
         address signer = ECDSA.recover(_hashTypedDataV4(structHash), sig);
         require(signer == intent.player, "bad sig");
 
-        // nonce로 서명 재사용(리플레이) 방지: 무승부여도 새 서명 필요
         require(intent.nonce == nonces[intent.player], "bad nonce");
         nonces[intent.player]++;
 
-        // 1유저 1세션(대기 중 중복 게임 방지)
         Session storage s = sessions[intent.player];
         require(s.state == State.NONE, "already in game");
 
-        // 참가비: 예치금에서 차감(락)
+        // 참가비: 예치금에서 차감
         require(deposits[intent.player] >= entryFee, "deposit < entryFee");
         deposits[intent.player] -= entryFee;
         totalDeposits -= entryFee;
 
-        // 예약금: 무승부(참가비 환급) 또는 승리(당첨금 지급) 중 최댓값을 잠금
         uint256 perGameReserve = reward > entryFee ? reward : entryFee;
 
-        // VRF 대기 구간에서 하우스가 출금해도 지급불능이 나지 않도록 예약금을 반영해 체크
+        // VRF 대기 구간에서도 하우스가 출금해 지급불능이 안 나게 잠금 체크
         uint256 bal = SABU.balanceOf(address(this));
         uint256 lockedAfter = totalDeposits + totalWinningsOwed + reservedPending + perGameReserve;
         require(bal >= lockedAfter, "pool insufficient");
         reservedPending += perGameReserve;
 
-        // VRF 요청: blue/red 숫자 2개(0~9)
         requestId = s_vrfCoordinator.requestRandomWords(
             VRFV2PlusClient.RandomWordsRequest({
                 keyHash: keyHash,
@@ -232,12 +261,12 @@ contract CardGameVRF is
             startedAt: uint64(block.timestamp),
             reserved: perGameReserve
         });
-        requestToPlayer[requestId] = intent.player;
 
+        requestToPlayer[requestId] = intent.player;
         emit GameStarted(intent.player, requestId, intent.choiceBlue);
     }
 
-    // --- VRF 콜백: 결과 확정(무승부 포함) ---
+    // ====== VRF 콜백(결과 확정) ======
     function fulfillRandomWords(uint256 requestId, uint256[] calldata randomWords) internal override {
         address player = requestToPlayer[requestId];
         if (player == address(0)) return;
@@ -245,7 +274,6 @@ contract CardGameVRF is
         Session storage s = sessions[player];
         if (s.state != State.WAITING_VRF || s.requestId != requestId) return;
 
-        // 예약금 해제
         reservedPending -= s.reserved;
 
         uint256 blue = randomWords[0] % 10;
@@ -255,7 +283,7 @@ contract CardGameVRF is
         bool win = false;
 
         if (tie) {
-            // 무승부: 참가비를 예치금으로 즉시 환급(무제한 재게임 가능)
+            // 무승부: 참가비 환급(무제한 재게임 가능, 단 새 서명 필요)
             deposits[player] += entryFee;
             totalDeposits += entryFee;
             hasWon[player] = false;
@@ -265,11 +293,10 @@ contract CardGameVRF is
             hasWon[player] = win;
 
             if (win) {
-                // 승리: 당첨금 적립(출금은 유저가 직접 트랜잭션으로 수행)
                 winnings[player] += reward;
                 totalWinningsOwed += reward;
             }
-            // 패배: 참가비는 하우스 수익으로 확정(컨트랙트에 남음)
+            // 패배: 참가비는 하우스 수익으로 남음
         }
 
         delete sessions[player];
@@ -278,7 +305,7 @@ contract CardGameVRF is
         emit GameResolved(player, requestId, blue, red, win, tie);
     }
 
-    // VRF가 장시간 지연될 경우: 유저가 참가비를 환급 받고 세션을 해제(무승부 환급과 동일)
+    // VRF 지연 시 환급(무승부 환급과 동일)
     function refundAfterTimeout() external nonReentrant whenNotPaused {
         Session storage s = sessions[msg.sender];
         require(s.state == State.WAITING_VRF, "not waiting");
