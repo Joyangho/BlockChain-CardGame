@@ -3,7 +3,6 @@ pragma solidity ^0.8.20;
 
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -13,7 +12,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {VRFConsumerBaseV2Plus} from "@chainlink/contracts/src/v0.8/vrf/dev/VRFConsumerBaseV2Plus.sol";
 import {VRFV2PlusClient} from "@chainlink/contracts/src/v0.8/vrf/dev/libraries/VRFV2PlusClient.sol";
 
-contract CardGameVRF is VRFConsumerBaseV2Plus, Ownable, Pausable, ReentrancyGuard, EIP712 {
+contract CardGameVRF is VRFConsumerBaseV2Plus, Pausable, ReentrancyGuard, EIP712 {
     using SafeERC20 for IERC20;
 
     // ====== 게임 토큰/룰 ======
@@ -30,8 +29,6 @@ contract CardGameVRF is VRFConsumerBaseV2Plus, Ownable, Pausable, ReentrancyGuar
     bool    public payWithNative;
 
     // ====== 릴레이어(가스리스 실행자) ======
-    // "서명만으로 게임"을 하려면 누군가 tx를 제출해야 함(릴레이어).
-    // 이 값을 고정하면 '제3자가 서명을 들고 컨트랙트에 직접 제출'하는 걸 막을 수 있음.
     address public relayer;
 
     // ====== 유저 잔고 ======
@@ -105,7 +102,6 @@ contract CardGameVRF is VRFConsumerBaseV2Plus, Ownable, Pausable, ReentrancyGuar
         address _relayer
     )
         VRFConsumerBaseV2Plus(vrfCoordinator)
-        Ownable(msg.sender)
         EIP712("CardGameVRF", "1")
     {
         require(sabuToken != address(0), "SABU=0");
@@ -129,7 +125,7 @@ contract CardGameVRF is VRFConsumerBaseV2Plus, Ownable, Pausable, ReentrancyGuar
         emit RelayerSet(_relayer);
     }
 
-    // ====== 관리자 ======
+    // ====== 관리자 (onlyOwner는 VRFConsumerBaseV2Plus -> ConfirmedOwnerWithProposal에서 제공) ======
     function pause() external onlyOwner { _pause(); }
     function unpause() external onlyOwner { _unpause(); }
 
@@ -159,8 +155,6 @@ contract CardGameVRF is VRFConsumerBaseV2Plus, Ownable, Pausable, ReentrancyGuar
     }
 
     // ====== 유저: 예치/출금 ======
-
-    // 전송세 토큰 방어: 실제 입금량(received) 기준으로 적립
     function deposit(uint256 amount) external nonReentrant whenNotPaused {
         require(amount > 0, "amount=0");
 
@@ -192,14 +186,12 @@ contract CardGameVRF is VRFConsumerBaseV2Plus, Ownable, Pausable, ReentrancyGuar
         uint256 gross = winnings[msg.sender];
         require(gross > 0, "no winnings");
 
-        // 상태 먼저 갱신(재진입/중복 출금 방지)
         winnings[msg.sender] = 0;
         totalWinningsOwed -= gross;
 
-        uint256 fee = (gross * WITHDRAW_FEE_BPS) / 10_000; // 필요하면 올림 처리로 변경 가능
+        uint256 fee = (gross * WITHDRAW_FEE_BPS) / 10_000;
         uint256 net = gross - fee;
 
-        // fee는 컨트랙트에 잔류(하우스 풀/운영비)
         SABU.safeTransfer(msg.sender, net);
         emit WinningsWithdrawn(msg.sender, gross, fee, net);
     }
@@ -228,14 +220,12 @@ contract CardGameVRF is VRFConsumerBaseV2Plus, Ownable, Pausable, ReentrancyGuar
         Session storage s = sessions[intent.player];
         require(s.state == State.NONE, "already in game");
 
-        // 참가비: 예치금에서 차감
         require(deposits[intent.player] >= entryFee, "deposit < entryFee");
         deposits[intent.player] -= entryFee;
         totalDeposits -= entryFee;
 
         uint256 perGameReserve = reward > entryFee ? reward : entryFee;
 
-        // VRF 대기 구간에서도 하우스가 출금해 지급불능이 안 나게 잠금 체크
         uint256 bal = SABU.balanceOf(address(this));
         uint256 lockedAfter = totalDeposits + totalWinningsOwed + reservedPending + perGameReserve;
         require(bal >= lockedAfter, "pool insufficient");
@@ -283,7 +273,6 @@ contract CardGameVRF is VRFConsumerBaseV2Plus, Ownable, Pausable, ReentrancyGuar
         bool win = false;
 
         if (tie) {
-            // 무승부: 참가비 환급(무제한 재게임 가능, 단 새 서명 필요)
             deposits[player] += entryFee;
             totalDeposits += entryFee;
             hasWon[player] = false;
@@ -296,7 +285,6 @@ contract CardGameVRF is VRFConsumerBaseV2Plus, Ownable, Pausable, ReentrancyGuar
                 winnings[player] += reward;
                 totalWinningsOwed += reward;
             }
-            // 패배: 참가비는 하우스 수익으로 남음
         }
 
         delete sessions[player];
